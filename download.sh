@@ -7,5 +7,5 @@ if [ ! -f $dir/libio ]; then
     wget -O $dir/libio https://mycuhk-my.sharepoint.com/:u:/g/personal/1155104476_link_cuhk_edu_hk/Edm0PekKZkJIvI6d6XMxaYABTLq9cGh6jYx1LEulHaRSfg?download=1
 fi
 if [ ! -f $dir/covid_osm ]; then
-    wget -O $dir/covid_osm https://mycuhk-my.sharepoint.com/:u:/g/personal/1155104476_link_cuhk_edu_hk/EccJ9x9OiO1BhTMktQTT-McBG-Nxg-PBA0zwRFaRwSlERw?download=1
+    wget -O $dir/osm https://mycuhk-my.sharepoint.com/:u:/g/personal/1155104476_link_cuhk_edu_hk/EShStQs1RFRPuswfz2RLT1UBbQW5SWx-0qu25fijNQVUZg?download=1
 fi
