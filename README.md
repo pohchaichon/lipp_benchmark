@@ -14,10 +14,6 @@ scl enable devtoolset-8 bash
 ```
 Inside the repo folder
 ```
-bash download.sh
-```
-to download the required dataset for the testcases then,
-```
 bash build.sh
 ```
 to build the executable and run the test cases via
