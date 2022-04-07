@@ -7,7 +7,7 @@ run() {
     echo "testcase: $1"
     for tn in 2 4 8 16
     do
-        $dir/build/benchmark --keys_file=/research/dept7/ericlo_hpc/dataset_4160/$1 --read=0.5 --insert=0.5 --operations_num=200000000 --table_size=-1 --init_table_ratio=0.5 --thread_num=$tn --output_path=$dir/${filename} $2
+        $dir/build/benchmark --keys_file=/data/local/csci4160/$1 --read=0.5 --insert=0.5 --operations_num=200000000 --table_size=-1 --init_table_ratio=0.5 --thread_num=$tn --output_path=$dir/${filename} $2
     done
     echo
 }
