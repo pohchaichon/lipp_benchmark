@@ -246,7 +246,7 @@ public:
         ebr = EpochBasedMemoryReclamationStrategy::getInstance();
     }
     ~LIPP() {
-        //destroy_tree(root);
+        destroy_tree(root);
         root = NULL;
         //destory_pending();
     }
@@ -262,33 +262,52 @@ public:
         EpochGuard guard; // epoch memory reclaimation
         Node* node = root;
 		
-		omp_set_lock(&node->mutex);
+		omp_set_lock(&node->rMutex);
+		node->count ++ ;
+		if(node->count==1) omp_set_lock(&node->wMutex);
+		omp_unset_lock(&node->rMutex);
 		
         while (true) {
 			
             int pos = PREDICT_POS(node, key);
             if (BITMAP_GET(node->child_bitmap, pos) == 1) {
             	
-            	omp_set_lock(&node->items[pos].comp.child->mutex);
-            	omp_unset_lock(&node->mutex);
+            	omp_set_lock(&node->items[pos].comp.child->rMutex);
+				node->items[pos].comp.child->count ++ ;
+				if(node->items[pos].comp.child->count==1) omp_unset_lock(&node->items[pos].comp.child->wMutex);
+				omp_unset_lock(&node->items[pos].comp.child->rMutex);
+            	
+            	omp_set_lock(&node->rMutex);
+				node->count -- ;
+				if(node->count==0) omp_unset_lock(&node->wMutex);
+				omp_unset_lock(&node->rMutex);
             	
                 node = node->items[pos].comp.child;
             } else {
                 if (skip_existence_check) {
                 	
-                	omp_unset_lock(&node->mutex);
+                	omp_set_lock(&node->rMutex);
+					node->count -- ;
+					if(node->count==0) omp_unset_lock(&node->wMutex);
+					omp_unset_lock(&node->rMutex);
                 	
                     return node->items[pos].comp.data.value;
                 } else {
                     if (BITMAP_GET(node->none_bitmap, pos) == 1) {
                         RT_ASSERT(false);
                         
-                        omp_unset_lock(&node->mutex);
+                        omp_set_lock(&node->rMutex);
+						node->count -- ;
+						if(node->count==0) omp_unset_lock(&node->wMutex);
+						omp_unset_lock(&node->rMutex);
                         
                     } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
                         RT_ASSERT(node->items[pos].comp.data.key == key);
                         
-                        omp_unset_lock(&node->mutex);
+                        omp_set_lock(&node->rMutex);
+						node->count -- ;
+						if(node->count==0) omp_unset_lock(&node->wMutex);
+						omp_unset_lock(&node->rMutex);
                         
                         return node->items[pos].comp.data.value;
                     }
@@ -484,8 +503,11 @@ private:
         bitmap_t* none_bitmap; // 1 means None, 0 means Data or Child
         bitmap_t* child_bitmap; // 1 means Child. will always be 0 when none_bitmap is 1
         
+        omp_lock_t rMutex; //a lock
+        omp_lock_t wMutex;
+        int count;
+        
         int logical_delete = false;
-        omp_lock_t mutex; //a lock
         
     };
 
@@ -497,7 +519,9 @@ private:
     {
         Node* p = node_allocator.allocate(n);
                 
-        omp_init_lock(&p->mutex);
+        omp_init_lock(&p->rMutex);
+        omp_init_lock(&p->wMutex);
+        p->count = 0;
         
         RT_ASSERT(p != NULL && p != (Node*)(-1));
         return p;
@@ -505,18 +529,19 @@ private:
     void delete_nodes(Node* p, int n)
     {
     	
-    	omp_destroy_lock(&p->mutex);
+    	omp_destroy_lock(&p->rMutex);
+    	omp_destroy_lock(&p->wMutex);
     	
         node_allocator.deallocate(p, n);
     }
-	void ori_delete_nodes(Node* p, int n)
+    void ori_delete_nodes(Node* p, int n)
     {
 
-        omp_destroy_lock(&p->mutex);
+        omp_destroy_lock(&p->rMutex);
+        omp_destroy_lock(&p->wMutex);
 
         node_allocator.deallocate(p, n);
     }
-
 
     std::allocator<Item> item_allocator;
     Item* new_items(int n)
@@ -525,14 +550,15 @@ private:
         RT_ASSERT(p != NULL && p != (Item*)(-1));
         return p;
     }
-     void ori_delete_items(Item* p, int n)
-    {
-        item_allocator.deallocate(p, n);
-    }
     void delete_items(Item* p, int n)
     {
         item_allocator.deallocate(p, n);
     }
+    void ori_delete_items(Item* p, int n)
+    {
+        item_allocator.deallocate(p, n);
+    }
+    
 
     std::allocator<bitmap_t> bitmap_allocator;
     bitmap_t* new_bitmap(int n)
@@ -969,7 +995,7 @@ private:
             Node* node = s.top().second;
             const int SHOULD_END_POS = begin + node->size;
             
-            omp_set_lock(&node->mutex);
+            omp_set_lock(&node->wMutex);
             
             s.pop();
 
@@ -986,7 +1012,7 @@ private:
                 }
             }
             
-            omp_unset_lock(&node->mutex);
+            omp_unset_lock(&node->wMutex);
             
             RT_ASSERT(SHOULD_END_POS == begin);
 
@@ -1023,7 +1049,7 @@ private:
         int path_size = 0;
         int insert_to_data = 0;
         
-        omp_set_lock(&_node->mutex);
+        omp_set_lock(&_node->wMutex);
 
         for (Node* node = _node; ; ) {
             RT_ASSERT(path_size < MAX_DEPTH);
@@ -1036,7 +1062,7 @@ private:
                 node->items[pos].comp.data.key = key;
                 node->items[pos].comp.data.value = value;
                 
-                omp_unset_lock(&node->mutex);
+                omp_unset_lock(&node->wMutex);
                 
                 break;
             } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
@@ -1044,13 +1070,13 @@ private:
                 node->items[pos].comp.child = build_tree_two(key, value, node->items[pos].comp.data.key, node->items[pos].comp.data.value);
                 insert_to_data = 1;
                 
-                omp_unset_lock(&node->mutex);
+                omp_unset_lock(&node->wMutex);
                 
                 break;
             } else {
             	
-            	omp_set_lock(&node->items[pos].comp.child->mutex);
-            	omp_unset_lock(&node->mutex);
+            	omp_set_lock(&node->items[pos].comp.child->wMutex);
+            	omp_unset_lock(&node->wMutex);
             	
                 node = node->items[pos].comp.child;
             }
