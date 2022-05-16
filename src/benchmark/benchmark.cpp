@@ -169,7 +169,7 @@ public:
         param_t params[thread_num];
         TSCNS tn;
         tn.init();
-        // printf("Begin running\n");
+        printf("Begin running\n");
         auto start_time = tn.rdtsc();
         auto end_time = tn.rdtsc();
 //        System::profile("perf.data", [&]() {
@@ -186,7 +186,7 @@ public:
             // waiting all thread ready
 #pragma omp barrier
 #pragma omp master
-            start_time = tn.rdtsc();
+            start_time = tn.rdtsc(); 
 // running benchmark
 #pragma omp for schedule(dynamic, 10000)
             for (auto i = 0; i < operations_num; i++) {
@@ -195,13 +195,12 @@ public:
 
                 if (latency_sample && i % latency_sample_interval == 0)
                     latency_sample_start_time = tn.rdtsc();
-
                 if (op == READ) {  // get
                     PAYLOAD_TYPE val = index.at(key, false);
-                    // if(val != key) {
-                    //     printf("read failed, Key %lu, val %llu\n",key, val);
-                    //     exit(1);
-                    // }
+//                    if(val != key) {
+//                        printf("read failed, Key %lu, val %llu\n",key, val);
+//                        exit(1);
+//                   }
                 } else if (op == INSERT) {  // insert
                     index.insert(key, key);
                 }
@@ -267,9 +266,9 @@ public:
 };
 
 int main(int argc, char **argv) {
-    Benchmark <uint64_t, uint64_t> bench;
+    Benchmark <uint64_t, uint64_t> bench; 
     bench.parse_args(argc, argv);
     bench.load_keys();
-    bench.generate_operations();
-    bench.run();
+    bench.generate_operations(); 
+    bench.run(); 
 }

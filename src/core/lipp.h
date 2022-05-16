@@ -45,6 +45,10 @@ typedef void (*dealloc_func)(void *ptr);
 #include <chrono>
 #endif
 
+omp_lock_t adjustment_lock;
+//omp_init_lock(&adjustment_lock);
+omp_lock_t pending_lock;
+
 template<class T, class P, bool USE_FMCD = true>
 class LIPP
 {
@@ -242,9 +246,9 @@ public:
         ebr = EpochBasedMemoryReclamationStrategy::getInstance();
     }
     ~LIPP() {
-        destroy_tree(root);
+        //destroy_tree(root);
         root = NULL;
-        destory_pending();
+        //destory_pending();
     }
 
     void insert(const V& v) {
@@ -257,23 +261,39 @@ public:
     P at(const T& key, bool skip_existence_check = true) const {
         EpochGuard guard; // epoch memory reclaimation
         Node* node = root;
-
+		
+		omp_set_lock(&node->mutex);
+		
         while (true) {
+			
             int pos = PREDICT_POS(node, key);
             if (BITMAP_GET(node->child_bitmap, pos) == 1) {
+            	
+            	omp_set_lock(&node->items[pos].comp.child->mutex);
+            	omp_unset_lock(&node->mutex);
+            	
                 node = node->items[pos].comp.child;
             } else {
                 if (skip_existence_check) {
+                	
+                	omp_unset_lock(&node->mutex);
+                	
                     return node->items[pos].comp.data.value;
                 } else {
                     if (BITMAP_GET(node->none_bitmap, pos) == 1) {
                         RT_ASSERT(false);
+                        
+                        omp_unset_lock(&node->mutex);
+                        
                     } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
                         RT_ASSERT(node->items[pos].comp.data.key == key);
+                        
+                        omp_unset_lock(&node->mutex);
+                        
                         return node->items[pos].comp.data.value;
                     }
                 }
-            }
+            }   
         }
     }
     bool exists(const T& key) const {
@@ -463,6 +483,10 @@ private:
         Item* items;
         bitmap_t* none_bitmap; // 1 means None, 0 means Data or Child
         bitmap_t* child_bitmap; // 1 means Child. will always be 0 when none_bitmap is 1
+        
+        int logical_delete = false;
+        omp_lock_t mutex; //a lock
+        
     };
 
     Node* root;
@@ -472,13 +496,27 @@ private:
     Node* new_nodes(int n)
     {
         Node* p = node_allocator.allocate(n);
+                
+        omp_init_lock(&p->mutex);
+        
         RT_ASSERT(p != NULL && p != (Node*)(-1));
         return p;
     }
     void delete_nodes(Node* p, int n)
     {
+    	
+    	omp_destroy_lock(&p->mutex);
+    	
         node_allocator.deallocate(p, n);
     }
+	void ori_delete_nodes(Node* p, int n)
+    {
+
+        omp_destroy_lock(&p->mutex);
+
+        node_allocator.deallocate(p, n);
+    }
+
 
     std::allocator<Item> item_allocator;
     Item* new_items(int n)
@@ -486,6 +524,10 @@ private:
         Item* p = item_allocator.allocate(n);
         RT_ASSERT(p != NULL && p != (Item*)(-1));
         return p;
+    }
+     void ori_delete_items(Item* p, int n)
+    {
+        item_allocator.deallocate(p, n);
     }
     void delete_items(Item* p, int n)
     {
@@ -500,6 +542,10 @@ private:
         return p;
     }
     void delete_bitmap(bitmap_t* p, int n)
+    {
+        bitmap_allocator.deallocate(p, n);
+    }
+    void ori_delete_bitmap(bitmap_t* p, int n)
     {
         bitmap_allocator.deallocate(p, n);
     }
@@ -521,7 +567,6 @@ private:
         BITMAP_SET(node->none_bitmap, 0);
         node->child_bitmap = new_bitmap(1);
         node->child_bitmap[0] = 0;
-
         return node;
     }
     /// build a tree with two keys
@@ -533,6 +578,8 @@ private:
         }
         RT_ASSERT(key1 < key2);
         static_assert(BITMAP_WIDTH == 8);
+
+		omp_set_lock(&pending_lock);
 
         Node* node = NULL;
         if (pending_two.empty()) {
@@ -552,6 +599,8 @@ private:
         } else {
             node = pending_two.top(); pending_two.pop();
         }
+
+		omp_unset_lock(&pending_lock);
 
         const long double mid1_key = key1;
         const long double mid2_key = key2;
@@ -851,18 +900,24 @@ private:
         return ret;
     }
 
-    void destory_pending()
-    {
-        while (!pending_two.empty()) {
-            Node* node = pending_two.top(); pending_two.pop();
-
-            delete_items(node->items, node->num_items);
-            const int bitmap_size = BITMAP_SIZE(node->num_items);
-            delete_bitmap(node->none_bitmap, bitmap_size);
-            delete_bitmap(node->child_bitmap, bitmap_size);
-            delete_nodes(node, 1);
-        }
-    }
+//    void destory_pending()
+//    {
+//    	
+//    	omp_set_lock(&pending_lock);
+//    	
+//        while (!pending_two.empty()) {
+//            Node* node = pending_two.top(); pending_two.pop();
+//
+//            delete_items(node->items, node->num_items);
+//            const int bitmap_size = BITMAP_SIZE(node->num_items);
+//            delete_bitmap(node->none_bitmap, bitmap_size);
+//            delete_bitmap(node->child_bitmap, bitmap_size);
+//            delete_nodes(node, 1);
+//        }
+//        
+//        omp_unset_lock(&pending_lock);
+//        
+//    }
 
     void destroy_tree(Node* root)
     {
@@ -870,6 +925,9 @@ private:
         s.push(root);
         while (!s.empty()) {
             Node* node = s.top(); s.pop();
+            if(node->logical_delete){
+                continue;
+            }
 
             for (int i = 0; i < node->num_items; i ++) {
                 if (BITMAP_GET(node->child_bitmap, i) == 1) {
@@ -877,26 +935,31 @@ private:
                 }
             }
 
-            if (node->is_two) {
-                RT_ASSERT(node->build_size == 2);
-                RT_ASSERT(node->num_items == 8);
-                node->size = 2;
-                node->num_inserts = node->num_insert_to_data = 0;
-                node->none_bitmap[0] = 0xff;
-                node->child_bitmap[0] = 0;
-                pending_two.push(node);
-            } else {
-                delete_items(node->items, node->num_items);
+//            if (node->is_two) {
+//                RT_ASSERT(node->build_size == 2);
+//                RT_ASSERT(node->num_items == 8);
+//                node->size = 2;
+//                node->num_inserts = node->num_insert_to_data = 0;
+//                node->none_bitmap[0] = 0xff;
+//                node->child_bitmap[0] = 0;
+//                omp_set_lock(&pending_two_lock);
+//                pending_two.push(node);
+//                omp_unset_lock(&pending_two_lock);
+//            } else {
+                ori_delete_items(node->items, node->num_items);
                 const int bitmap_size = BITMAP_SIZE(node->num_items);
-                delete_bitmap(node->none_bitmap, bitmap_size);
-                delete_bitmap(node->child_bitmap, bitmap_size);
-                delete_nodes(node, 1);
-            }
+                ori_delete_bitmap(node->none_bitmap, bitmap_size);
+                ori_delete_bitmap(node->child_bitmap, bitmap_size);
+                ori_delete_nodes(node, 1);
+//            }
         }
     }
 
     void scan_and_destory_tree(Node* _root, T* keys, P* values, bool destory = true)
     {
+    	
+    	omp_set_lock(&adjustment_lock);
+    	
         typedef std::pair<int, Node*> Segment; // <begin, Node*>
         std::stack<Segment> s;
 
@@ -905,6 +968,9 @@ private:
             int begin = s.top().first;
             Node* node = s.top().second;
             const int SHOULD_END_POS = begin + node->size;
+            
+            omp_set_lock(&node->mutex);
+            
             s.pop();
 
             for (int i = 0; i < node->num_items; i ++) {
@@ -919,26 +985,35 @@ private:
                     }
                 }
             }
+            
+            omp_unset_lock(&node->mutex);
+            
             RT_ASSERT(SHOULD_END_POS == begin);
 
             if (destory) {
-                if (node->is_two) {
-                    RT_ASSERT(node->build_size == 2);
-                    RT_ASSERT(node->num_items == 8);
-                    node->size = 2;
-                    node->num_inserts = node->num_insert_to_data = 0;
-                    node->none_bitmap[0] = 0xff;
-                    node->child_bitmap[0] = 0;
-                    pending_two.push(node);
-                } else {
+//                if (node->is_two) {
+//                    RT_ASSERT(node->build_size == 2);
+//                    RT_ASSERT(node->num_items == 8);
+//                    node->size = 2;
+//                    node->num_inserts = node->num_insert_to_data = 0;
+//                    node->none_bitmap[0] = 0xff;
+//                    node->child_bitmap[0] = 0;
+//                    omp_set_lock(&pending_two_lock);
+//                    pending_two.push(node);
+//                    omp_unset_lock(&pending_two_lock);
+//                } else {
+                    node->logical_delete = true;
                     delete_items(node->items, node->num_items);
                     const int bitmap_size = BITMAP_SIZE(node->num_items);
                     delete_bitmap(node->none_bitmap, bitmap_size);
                     delete_bitmap(node->child_bitmap, bitmap_size);
                     delete_nodes(node, 1);
-                }
+//                }
             }
         }
+        
+        omp_unset_lock(&adjustment_lock);
+        
     }
 
     Node* insert_tree(Node* _node, const T& key, const P& value)
@@ -947,11 +1022,12 @@ private:
         Node* path[MAX_DEPTH];
         int path_size = 0;
         int insert_to_data = 0;
+        
+        omp_set_lock(&_node->mutex);
 
         for (Node* node = _node; ; ) {
             RT_ASSERT(path_size < MAX_DEPTH);
-            path[path_size ++] = node;
-
+            path[path_size ++] = node;	
             node->size ++;
             node->num_inserts ++;
             int pos = PREDICT_POS(node, key);
@@ -959,16 +1035,27 @@ private:
                 BITMAP_CLEAR(node->none_bitmap, pos);
                 node->items[pos].comp.data.key = key;
                 node->items[pos].comp.data.value = value;
+                
+                omp_unset_lock(&node->mutex);
+                
                 break;
             } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
                 BITMAP_SET(node->child_bitmap, pos);
                 node->items[pos].comp.child = build_tree_two(key, value, node->items[pos].comp.data.key, node->items[pos].comp.data.value);
                 insert_to_data = 1;
+                
+                omp_unset_lock(&node->mutex);
+                
                 break;
             } else {
+            	
+            	omp_set_lock(&node->items[pos].comp.child->mutex);
+            	omp_unset_lock(&node->mutex);
+            	
                 node = node->items[pos].comp.child;
             }
         }
+        
         for (int i = 0; i < path_size; i ++) {
             path[i]->num_insert_to_data += insert_to_data;
         }
@@ -1020,5 +1107,7 @@ private:
         return path[0];
     }
 };
+
+//omp_unset_destory(&omp_lock);
 
 #endif // __LIPP_H__
