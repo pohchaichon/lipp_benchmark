@@ -28,14 +28,14 @@ typedef uint8_t bitmap_t;
 #define BITMAP_CLEAR(bitmap, pos) ((bitmap)[(pos) / BITMAP_WIDTH] &= ~bitmap_t(1 << ((pos) % BITMAP_WIDTH)))
 #define BITMAP_NEXT_1(bitmap_item) __builtin_ctz((bitmap_item))
 
-// runtime assert
-#define RT_ASSERT(expr) \
-{ \
-    if (!(expr)) { \
-        fprintf(stderr, "RT_ASSERT Error at %s:%d, `%s`\n", __FILE__, __LINE__, #expr); \
-        exit(0); \
-    } \
-}
+//// runtime assert
+//#define RT_ASSERT(expr) \
+//{ \
+//    if (!(expr)) { \
+//        fprintf(stderr, "RT_ASSERT Error at %s:%d, `%s`\n", __FILE__, __LINE__, #expr); \
+//        exit(0); \
+//    } \
+//}
 
 typedef void (*dealloc_func)(void *ptr);
 
@@ -46,13 +46,11 @@ typedef void (*dealloc_func)(void *ptr);
 #endif
 
 omp_lock_t adjustment_lock;
-//omp_init_lock(&adjustment_lock);
-omp_lock_t pending_lock;
 
 template<class T, class P, bool USE_FMCD = true>
 class LIPP
 {
-    static_assert(std::is_arithmetic<T>::value, "LIPP key type must be numeric.");
+//    static_assert(std::is_arithmetic<T>::value, "LIPP key type must be numeric.");
 
     inline int compute_gap_count(int size) {
         if (size >= 1000000) return 1;
@@ -82,30 +80,30 @@ class LIPP
     struct {
         long long fmcd_success_times = 0;
         long long fmcd_broken_times = 0;
-        #if COLLECT_TIME
+#if COLLECT_TIME
         double time_scan_and_destory_tree = 0;
         double time_build_tree_bulk = 0;
-        #endif
+#endif
     } stats;
 
 public:
     // Epoch based Memory Reclaim
     class ThreadSpecificEpochBasedReclamationInformation {
-        std::array<std::vector<std::pair<void *, dealloc_func>>, 3> mFreeLists;
+        std::array<std::vector<std::tuple<void *, int,int>>, 3> mFreeLists;
         std::atomic<uint32_t> mLocalEpoch;
         uint32_t mPreviouslyAccessedEpoch;
         bool mThreadWantsToAdvance;
 
     public:
         ThreadSpecificEpochBasedReclamationInformation()
-            : mFreeLists(), mLocalEpoch(3), mPreviouslyAccessedEpoch(3),
-            mThreadWantsToAdvance(false) {}
+                : mFreeLists(), mLocalEpoch(3), mPreviouslyAccessedEpoch(3),
+                  mThreadWantsToAdvance(false) {}
 
         ThreadSpecificEpochBasedReclamationInformation(
-            ThreadSpecificEpochBasedReclamationInformation const &other) = delete;
+                ThreadSpecificEpochBasedReclamationInformation const &other) = delete;
 
         ThreadSpecificEpochBasedReclamationInformation(
-            ThreadSpecificEpochBasedReclamationInformation &&other) = delete;
+                ThreadSpecificEpochBasedReclamationInformation &&other) = delete;
 
         ~ThreadSpecificEpochBasedReclamationInformation() {
             for (uint32_t i = 0; i < 3; ++i) {
@@ -113,10 +111,10 @@ public:
             }
         }
 
-        void scheduleForDeletion(std::pair<void *, dealloc_func> func_pair) {
-            assert(mLocalEpoch != 3);
-            std::vector<std::pair<void *, dealloc_func>> &currentFreeList =
-                mFreeLists[mLocalEpoch];
+        void scheduleForDeletion(std::tuple<void *, int,int> func_pair) {
+//            assert(mLocalEpoch != 3);
+            std::vector<std::tuple<void *, int,int>> &currentFreeList =
+                    mFreeLists[mLocalEpoch];
             currentFreeList.emplace_back(func_pair);
             mThreadWantsToAdvance = (currentFreeList.size() % 64u) == 0;
         }
@@ -126,7 +124,7 @@ public:
         }
 
         void enter(uint32_t newEpoch) {
-            assert(mLocalEpoch == 3);
+//            assert(mLocalEpoch == 3);
             if (mPreviouslyAccessedEpoch != newEpoch) {
                 freeForEpoch(newEpoch);
                 mThreadWantsToAdvance = false;
@@ -140,11 +138,64 @@ public:
         bool doesThreadWantToAdvanceEpoch() { return (mThreadWantsToAdvance); }
 
     private:
+        struct my_Item
+        {
+            union {
+                struct {
+                    T key;
+                    P value;
+                } data;
+                Node* child;
+            } comp;
+        };
+        struct my_Node
+        {
+            int is_two; // is special node for only two keys
+            int build_size; // tree size (include sub nodes) when node created
+            int size; // current tree size (include sub nodes)
+            int fixed; // fixed node will not trigger rebuild
+            int num_inserts, num_insert_to_data;
+            int num_items; // size of items
+            LinearModel<T> model;
+            my_Item* items;
+            bitmap_t* none_bitmap; // 1 means None, 0 means Data or Child
+            bitmap_t* child_bitmap; // 1 means Child. will always be 0 when none_bitmap is 1
+
+            omp_lock_t mutex; //a lock
+
+        };
+        std::allocator<my_Node> node_allocator;
+        void my_delete_nodes(my_Node* p, int n)
+        {
+
+            omp_destroy_lock(&p->mutex);
+
+            node_allocator.deallocate(p, n);
+        }
+        std::allocator<my_Item> item_allocator;
+        void my_delete_items(my_Item* p, int n)
+        {
+            item_allocator.deallocate(p, n);
+        }
+        std::allocator<bitmap_t> bitmap_allocator;
+        void my_delete_bitmap(bitmap_t* p, int n)
+        {
+            bitmap_allocator.deallocate(p, n);
+        }
         void freeForEpoch(uint32_t epoch) {
-            std::vector<std::pair<void *, dealloc_func>> &previousFreeList =
-                mFreeLists[epoch];
-            for (std::pair<void *, dealloc_func> func_pair : previousFreeList) {
-                func_pair.second(func_pair.first);
+            std::vector<std::tuple<void *, int,int>> &previousFreeList =
+                    mFreeLists[epoch];
+            for (std::tuple<void *, int,int> func_pair : previousFreeList) {
+                if (std::get<1>(func_pair)==0){
+                    my_Item* my_item = reinterpret_cast<my_Item*>(std::get<0>(func_pair));
+                    my_delete_items(my_item, std::get<2>(func_pair));
+                }else if (std::get<1>(func_pair)==1){
+                    bitmap_t* my_item = reinterpret_cast<bitmap_t*>(std::get<0>(func_pair));
+                    my_delete_bitmap(my_item, std::get<2>(func_pair));
+                }else if (std::get<1>(func_pair)==2){
+                    my_Node* my_item = reinterpret_cast<my_Node*>(std::get<0>(func_pair));
+                    my_delete_nodes(my_item, std::get<2>(func_pair));
+                }
             }
             previousFreeList.resize(0u);
         }
@@ -157,52 +208,52 @@ public:
 
         std::atomic<uint32_t> mCurrentEpoch;
         tbb::enumerable_thread_specific<
-            ThreadSpecificEpochBasedReclamationInformation,
-            tbb::cache_aligned_allocator<
+        ThreadSpecificEpochBasedReclamationInformation,
+        tbb::cache_aligned_allocator<
                 ThreadSpecificEpochBasedReclamationInformation>,
-            tbb::ets_key_per_instance>
-            mThreadSpecificInformations;
+        tbb::ets_key_per_instance>
+                mThreadSpecificInformations;
 
     private:
         EpochBasedMemoryReclamationStrategy()
-            : mCurrentEpoch(0), mThreadSpecificInformations() {}
+                : mCurrentEpoch(0), mThreadSpecificInformations() {}
 
     public:
         static EpochBasedMemoryReclamationStrategy *getInstance() {
-        static EpochBasedMemoryReclamationStrategy instance;
-        return &instance;
+            static EpochBasedMemoryReclamationStrategy instance;
+            return &instance;
         }
 
         void enterCriticalSection() {
             ThreadSpecificEpochBasedReclamationInformation &currentMemoryInformation =
-                mThreadSpecificInformations.local();
+                    mThreadSpecificInformations.local();
             uint32_t currentEpoch = mCurrentEpoch.load(std::memory_order_acquire);
             currentMemoryInformation.enter(currentEpoch);
             if (currentMemoryInformation.doesThreadWantToAdvanceEpoch() &&
                 canAdvance(currentEpoch)) {
                 mCurrentEpoch.compare_exchange_strong(currentEpoch,
-                                                    NEXT_EPOCH[currentEpoch]);
+                                                      NEXT_EPOCH[currentEpoch]);
             }
         }
 
         bool canAdvance(uint32_t currentEpoch) {
             uint32_t previousEpoch = PREVIOUS_EPOCH[currentEpoch];
             return !std::any_of(
-                mThreadSpecificInformations.begin(),
-                mThreadSpecificInformations.end(),
-                [previousEpoch](ThreadSpecificEpochBasedReclamationInformation const
+                    mThreadSpecificInformations.begin(),
+                    mThreadSpecificInformations.end(),
+                    [previousEpoch](ThreadSpecificEpochBasedReclamationInformation const
                                     &threadInformation) {
-                    return (threadInformation.getLocalEpoch() == previousEpoch);
-                });
+                        return (threadInformation.getLocalEpoch() == previousEpoch);
+                    });
         }
 
         void leaveCriticialSection() {
             ThreadSpecificEpochBasedReclamationInformation &currentMemoryInformation =
-                mThreadSpecificInformations.local();
+                    mThreadSpecificInformations.local();
             currentMemoryInformation.leave();
         }
 
-        void scheduleForDeletion(std::pair<void *, dealloc_func> func_pair) {
+        void scheduleForDeletion(std::tuple<void *, int,int> func_pair) {
             mThreadSpecificInformations.local().scheduleForDeletion(func_pair);
         }
     };
@@ -220,11 +271,11 @@ public:
     };
 
     EpochBasedMemoryReclamationStrategy *ebr;
-    
+
     typedef std::pair<T, P> V;
 
     LIPP(double BUILD_LR_REMAIN = 0, bool QUIET = true)
-        : BUILD_LR_REMAIN(BUILD_LR_REMAIN), QUIET(QUIET) {
+            : BUILD_LR_REMAIN(BUILD_LR_REMAIN), QUIET(QUIET) {
         {
             std::vector<Node*> nodes;
             for (int _ = 0; _ < 1e7; _ ++) {
@@ -234,9 +285,9 @@ public:
             for (auto node : nodes) {
                 destroy_tree(node);
             }
-            if (!QUIET) {
-                printf("initial memory pool size = %lu\n", pending_two.size());
-            }
+//            if (!QUIET) {
+//                printf("initial memory pool size = %lu\n", pending_two.size());
+//            }
         }
         if (USE_FMCD && !QUIET) {
             printf("enable FMCD\n");
@@ -246,9 +297,9 @@ public:
         ebr = EpochBasedMemoryReclamationStrategy::getInstance();
     }
     ~LIPP() {
-        destroy_tree(root);
+//        destroy_tree(root);
         root = NULL;
-        //destory_pending();
+//        destory_pending();
     }
 
     void insert(const V& v) {
@@ -261,58 +312,27 @@ public:
     P at(const T& key, bool skip_existence_check = true) const {
         EpochGuard guard; // epoch memory reclaimation
         Node* node = root;
-		
-		omp_set_lock(&node->rMutex);
-		node->count ++ ;
-		if(node->count==1) omp_set_lock(&node->wMutex);
-		omp_unset_lock(&node->rMutex);
-		
+
         while (true) {
-			
             int pos = PREDICT_POS(node, key);
             if (BITMAP_GET(node->child_bitmap, pos) == 1) {
-            	
-            	omp_set_lock(&node->items[pos].comp.child->rMutex);
-				node->items[pos].comp.child->count ++ ;
-				if(node->items[pos].comp.child->count==1) omp_unset_lock(&node->items[pos].comp.child->wMutex);
-				omp_unset_lock(&node->items[pos].comp.child->rMutex);
-            	
-            	omp_set_lock(&node->rMutex);
-				node->count -- ;
-				if(node->count==0) omp_unset_lock(&node->wMutex);
-				omp_unset_lock(&node->rMutex);
-            	
+
                 node = node->items[pos].comp.child;
+
+
             } else {
                 if (skip_existence_check) {
-                	
-                	omp_set_lock(&node->rMutex);
-					node->count -- ;
-					if(node->count==0) omp_unset_lock(&node->wMutex);
-					omp_unset_lock(&node->rMutex);
-                	
+
                     return node->items[pos].comp.data.value;
                 } else {
                     if (BITMAP_GET(node->none_bitmap, pos) == 1) {
-                        RT_ASSERT(false);
-                        
-                        omp_set_lock(&node->rMutex);
-						node->count -- ;
-						if(node->count==0) omp_unset_lock(&node->wMutex);
-						omp_unset_lock(&node->rMutex);
-                        
+                    	
                     } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
-                        RT_ASSERT(node->items[pos].comp.data.key == key);
-                        
-                        omp_set_lock(&node->rMutex);
-						node->count -- ;
-						if(node->count==0) omp_unset_lock(&node->wMutex);
-						omp_unset_lock(&node->rMutex);
-                        
+                    	
                         return node->items[pos].comp.data.value;
                     }
                 }
-            }   
+            }
         }
     }
     bool exists(const T& key) const {
@@ -347,10 +367,10 @@ public:
             return;
         }
 
-        RT_ASSERT(num_keys > 2);
-        for (int i = 1; i < num_keys; i ++) {
-            RT_ASSERT(vs[i].first > vs[i-1].first);
-        }
+//        RT_ASSERT(num_keys > 2);
+//        for (int i = 1; i < num_keys; i ++) {
+//            RT_ASSERT(vs[i].first > vs[i-1].first);
+//        }
 
         T* keys = new T[num_keys];
         P* values = new P[num_keys];
@@ -434,7 +454,7 @@ public:
                     sum_size ++;
                 }
             }
-            RT_ASSERT(sum_size == node->size);
+//            RT_ASSERT(sum_size == node->size);
         }
     }
     void print_stats() const {
@@ -443,15 +463,15 @@ public:
             printf("\t fmcd_success_times = %lld\n", stats.fmcd_success_times);
             printf("\t fmcd_broken_times = %lld\n", stats.fmcd_broken_times);
         }
-        #if COLLECT_TIME
+#if COLLECT_TIME
         printf("\t time_scan_and_destory_tree = %lf\n", stats.time_scan_and_destory_tree);
         printf("\t time_build_tree_bulk = %lf\n", stats.time_build_tree_bulk);
-        #endif
+#endif
     }
     size_t index_size(bool total=false, bool ignore_child=true) const {
         std::stack<Node*> s;
         s.push(root);
-    
+
         size_t size = 0;
         while (!s.empty()) {
             Node* node = s.top(); s.pop();
@@ -502,43 +522,33 @@ private:
         Item* items;
         bitmap_t* none_bitmap; // 1 means None, 0 means Data or Child
         bitmap_t* child_bitmap; // 1 means Child. will always be 0 when none_bitmap is 1
-        
-        omp_lock_t rMutex; //a lock
-        omp_lock_t wMutex;
-        int count;
-        
+
+        omp_lock_t mutex; //a lock
         int logical_delete = false;
-        
+        OptLock opt_lock;
     };
 
     Node* root;
-    std::stack<Node*> pending_two;
 
     std::allocator<Node> node_allocator;
     Node* new_nodes(int n)
     {
         Node* p = node_allocator.allocate(n);
-                
-        omp_init_lock(&p->rMutex);
-        omp_init_lock(&p->wMutex);
-        p->count = 0;
-        
-        RT_ASSERT(p != NULL && p != (Node*)(-1));
+
+        omp_init_lock(&p->mutex);
+
+//        RT_ASSERT(p != NULL && p != (Node*)(-1));
         return p;
     }
     void delete_nodes(Node* p, int n)
     {
-    	
-    	omp_destroy_lock(&p->rMutex);
-    	omp_destroy_lock(&p->wMutex);
-    	
-        node_allocator.deallocate(p, n);
+        std::tuple<void*, int, int> node_to_del(p, 2,n);
+        ebr->scheduleForDeletion(node_to_del);
     }
     void ori_delete_nodes(Node* p, int n)
     {
 
-        omp_destroy_lock(&p->rMutex);
-        omp_destroy_lock(&p->wMutex);
+        omp_destroy_lock(&p->mutex);
 
         node_allocator.deallocate(p, n);
     }
@@ -547,29 +557,30 @@ private:
     Item* new_items(int n)
     {
         Item* p = item_allocator.allocate(n);
-        RT_ASSERT(p != NULL && p != (Item*)(-1));
+//        RT_ASSERT(p != NULL && p != (Item*)(-1));
         return p;
-    }
-    void delete_items(Item* p, int n)
-    {
-        item_allocator.deallocate(p, n);
     }
     void ori_delete_items(Item* p, int n)
     {
         item_allocator.deallocate(p, n);
     }
-    
+    void delete_items(Item* p, int n)
+    {
+        std::tuple<void*, int, int> items_to_del(p, 0,n);
+        ebr->scheduleForDeletion(items_to_del);
+    }
 
     std::allocator<bitmap_t> bitmap_allocator;
     bitmap_t* new_bitmap(int n)
     {
         bitmap_t* p = bitmap_allocator.allocate(n);
-        RT_ASSERT(p != NULL && p != (bitmap_t*)(-1));
+//        RT_ASSERT(p != NULL && p != (bitmap_t*)(-1));
         return p;
     }
     void delete_bitmap(bitmap_t* p, int n)
     {
-        bitmap_allocator.deallocate(p, n);
+        std::tuple<void*, int, int> bitmap_to_del(p,1,n);
+        ebr->scheduleForDeletion(bitmap_to_del);
     }
     void ori_delete_bitmap(bitmap_t* p, int n)
     {
@@ -602,31 +613,23 @@ private:
             std::swap(key1, key2);
             std::swap(value1, value2);
         }
-        RT_ASSERT(key1 < key2);
-        static_assert(BITMAP_WIDTH == 8);
-
-		omp_set_lock(&pending_lock);
+//        RT_ASSERT(key1 < key2);
+//        static_assert(BITMAP_WIDTH == 8);
 
         Node* node = NULL;
-        if (pending_two.empty()) {
-            node = new_nodes(1);
-            node->is_two = 1;
-            node->build_size = 2;
-            node->size = 2;
-            node->fixed = 0;
-            node->num_inserts = node->num_insert_to_data = 0;
+        node = new_nodes(1);
+        node->is_two = 1;
+        node->build_size = 2;
+        node->size = 2;
+        node->fixed = 0;
+        node->num_inserts = node->num_insert_to_data = 0;
 
-            node->num_items = 8;
-            node->items = new_items(node->num_items);
-            node->none_bitmap = new_bitmap(1);
-            node->child_bitmap = new_bitmap(1);
-            node->none_bitmap[0] = 0xff;
-            node->child_bitmap[0] = 0;
-        } else {
-            node = pending_two.top(); pending_two.pop();
-        }
-
-		omp_unset_lock(&pending_lock);
+        node->num_items = 8;
+        node->items = new_items(node->num_items);
+        node->none_bitmap = new_bitmap(1);
+        node->child_bitmap = new_bitmap(1);
+        node->none_bitmap[0] = 0xff;
+        node->child_bitmap[0] = 0;
 
         const long double mid1_key = key1;
         const long double mid2_key = key2;
@@ -636,24 +639,23 @@ private:
 
         node->model.a = (mid2_target - mid1_target) / (mid2_key - mid1_key);
         node->model.b = mid1_target - node->model.a * mid1_key;
-        RT_ASSERT(isfinite(node->model.a));
-        RT_ASSERT(isfinite(node->model.b));
+//        RT_ASSERT(isfinite(node->model.a));
+//        RT_ASSERT(isfinite(node->model.b));
 
         { // insert key1&value1
             int pos = PREDICT_POS(node, key1);
-            RT_ASSERT(BITMAP_GET(node->none_bitmap, pos) == 1);
+//            RT_ASSERT(BITMAP_GET(node->none_bitmap, pos) == 1);
             BITMAP_CLEAR(node->none_bitmap, pos);
             node->items[pos].comp.data.key = key1;
             node->items[pos].comp.data.value = value1;
         }
         { // insert key2&value2
             int pos = PREDICT_POS(node, key2);
-            RT_ASSERT(BITMAP_GET(node->none_bitmap, pos) == 1);
+//            RT_ASSERT(BITMAP_GET(node->none_bitmap, pos) == 1);
             BITMAP_CLEAR(node->none_bitmap, pos);
             node->items[pos].comp.data.key = key2;
             node->items[pos].comp.data.value = value2;
         }
-
         return node;
     }
     /// bulk build, _keys must be sorted in asc order.
@@ -669,7 +671,7 @@ private:
     /// split keys into three parts at each node.
     Node* build_tree_bulk_fast(T* _keys, P* _values, int _size)
     {
-        RT_ASSERT(_size > 1);
+//        RT_ASSERT(_size > 1);
 
         typedef struct {
             int begin;
@@ -689,11 +691,11 @@ private:
             Node* node = s.top().node;
             s.pop();
 
-            RT_ASSERT(end - begin >= 2);
+//            RT_ASSERT(end - begin >= 2);
             if (end - begin == 2) {
                 Node* _ = build_tree_two(_keys[begin], _values[begin], _keys[begin+1], _values[begin+1]);
                 memcpy(node, _, sizeof(Node));
-                delete_nodes(_, 1);
+                ori_delete_nodes(_, 1);
             } else {
                 T* keys = _keys + begin;
                 P* values = _values + begin;
@@ -709,9 +711,9 @@ private:
                 int mid1_pos = (size - 1) / 3;
                 int mid2_pos = (size - 1) * 2 / 3;
 
-                RT_ASSERT(0 <= mid1_pos);
-                RT_ASSERT(mid1_pos < mid2_pos);
-                RT_ASSERT(mid2_pos < size - 1);
+//                RT_ASSERT(0 <= mid1_pos);
+//                RT_ASSERT(mid1_pos < mid2_pos);
+//                RT_ASSERT(mid2_pos < size - 1);
 
                 const long double mid1_key =
                         (static_cast<long double>(keys[mid1_pos]) + static_cast<long double>(keys[mid1_pos + 1])) / 2;
@@ -724,8 +726,8 @@ private:
 
                 node->model.a = (mid2_target - mid1_target) / (mid2_key - mid1_key);
                 node->model.b = mid1_target - node->model.a * mid1_key;
-                RT_ASSERT(isfinite(node->model.a));
-                RT_ASSERT(isfinite(node->model.b));
+//                RT_ASSERT(isfinite(node->model.a));
+//                RT_ASSERT(isfinite(node->model.b));
 
                 const int lr_remains = static_cast<int>(size * BUILD_LR_REMAIN);
                 node->model.b += lr_remains;
@@ -779,7 +781,7 @@ private:
     /// FMCD method.
     Node* build_tree_bulk_fmcd(T* _keys, P* _values, int _size)
     {
-        RT_ASSERT(_size > 1);
+//        RT_ASSERT(_size > 1);
 
         typedef struct {
             int begin;
@@ -799,11 +801,11 @@ private:
             Node* node = s.top().node;
             s.pop();
 
-            RT_ASSERT(end - begin >= 2);
+//            RT_ASSERT(end - begin >= 2);
             if (end - begin == 2) {
                 Node* _ = build_tree_two(_keys[begin], _values[begin], _keys[begin+1], _values[begin+1]);
                 memcpy(node, _, sizeof(Node));
-                delete_nodes(_, 1);
+                ori_delete_nodes(_, 1);
             } else {
                 T* keys = _keys + begin;
                 P* values = _values + begin;
@@ -826,7 +828,7 @@ private:
                     const int L = size * static_cast<int>(BUILD_GAP_CNT + 1);
                     int i = 0;
                     int D = 1;
-                    RT_ASSERT(D <= size-1-D);
+//                    RT_ASSERT(D <= size-1-D);
                     double Ut = (static_cast<long double>(keys[size - 1 - D]) - static_cast<long double>(keys[D])) /
                                 (static_cast<double>(L - 2)) + 1e-6;
                     while (i < size - 1 - D) {
@@ -838,7 +840,7 @@ private:
                         }
                         D = D + 1;
                         if (D * 3 > size) break;
-                        RT_ASSERT(D <= size-1-D);
+//                        RT_ASSERT(D <= size-1-D);
                         Ut = (static_cast<long double>(keys[size - 1 - D]) - static_cast<long double>(keys[D])) /
                              (static_cast<double>(L - 2)) + 1e-6;
                     }
@@ -848,8 +850,8 @@ private:
                         node->model.a = 1.0 / Ut;
                         node->model.b = (L - node->model.a * (static_cast<long double>(keys[size - 1 - D]) +
                                                               static_cast<long double>(keys[D]))) / 2;
-                        RT_ASSERT(isfinite(node->model.a));
-                        RT_ASSERT(isfinite(node->model.b));
+//                        RT_ASSERT(isfinite(node->model.a));
+//                        RT_ASSERT(isfinite(node->model.b));
                         node->num_items = L;
                     } else {
                         stats.fmcd_broken_times ++;
@@ -857,9 +859,9 @@ private:
                         int mid1_pos = (size - 1) / 3;
                         int mid2_pos = (size - 1) * 2 / 3;
 
-                        RT_ASSERT(0 <= mid1_pos);
-                        RT_ASSERT(mid1_pos < mid2_pos);
-                        RT_ASSERT(mid2_pos < size - 1);
+//                        RT_ASSERT(0 <= mid1_pos);
+//                        RT_ASSERT(mid1_pos < mid2_pos);
+//                        RT_ASSERT(mid2_pos < size - 1);
 
                         const long double mid1_key = (static_cast<long double>(keys[mid1_pos]) +
                                                       static_cast<long double>(keys[mid1_pos + 1])) / 2;
@@ -872,11 +874,11 @@ private:
 
                         node->model.a = (mid2_target - mid1_target) / (mid2_key - mid1_key);
                         node->model.b = mid1_target - node->model.a * mid1_key;
-                        RT_ASSERT(isfinite(node->model.a));
-                        RT_ASSERT(isfinite(node->model.b));
+//                        RT_ASSERT(isfinite(node->model.a));
+//                        RT_ASSERT(isfinite(node->model.b));
                     }
                 }
-                RT_ASSERT(node->model.a >= 0);
+//                RT_ASSERT(node->model.a >= 0);
                 const int lr_remains = static_cast<int>(size * BUILD_LR_REMAIN);
                 node->model.b += lr_remains;
                 node->num_items += lr_remains * 2;
@@ -926,25 +928,6 @@ private:
         return ret;
     }
 
-//    void destory_pending()
-//    {
-//    	
-//    	omp_set_lock(&pending_lock);
-//    	
-//        while (!pending_two.empty()) {
-//            Node* node = pending_two.top(); pending_two.pop();
-//
-//            delete_items(node->items, node->num_items);
-//            const int bitmap_size = BITMAP_SIZE(node->num_items);
-//            delete_bitmap(node->none_bitmap, bitmap_size);
-//            delete_bitmap(node->child_bitmap, bitmap_size);
-//            delete_nodes(node, 1);
-//        }
-//        
-//        omp_unset_lock(&pending_lock);
-//        
-//    }
-
     void destroy_tree(Node* root)
     {
         std::stack<Node*> s;
@@ -960,43 +943,29 @@ private:
                     s.push(node->items[i].comp.child);
                 }
             }
-
-//            if (node->is_two) {
-//                RT_ASSERT(node->build_size == 2);
-//                RT_ASSERT(node->num_items == 8);
-//                node->size = 2;
-//                node->num_inserts = node->num_insert_to_data = 0;
-//                node->none_bitmap[0] = 0xff;
-//                node->child_bitmap[0] = 0;
-//                omp_set_lock(&pending_two_lock);
-//                pending_two.push(node);
-//                omp_unset_lock(&pending_two_lock);
-//            } else {
-                ori_delete_items(node->items, node->num_items);
-                const int bitmap_size = BITMAP_SIZE(node->num_items);
-                ori_delete_bitmap(node->none_bitmap, bitmap_size);
-                ori_delete_bitmap(node->child_bitmap, bitmap_size);
-                ori_delete_nodes(node, 1);
-//            }
+            ori_delete_items(node->items, node->num_items);
+            const int bitmap_size = BITMAP_SIZE(node->num_items);
+            ori_delete_bitmap(node->none_bitmap, bitmap_size);
+            ori_delete_bitmap(node->child_bitmap, bitmap_size);
+            ori_delete_nodes(node, 1);
         }
     }
 
-    void scan_and_destory_tree(Node* _root, T* keys, P* values, bool destory = true)
+    std::stack<Node*> scan_and_destory_tree(Node* _root, T* keys, P* values, bool destory = true)
     {
-    	
-    	omp_set_lock(&adjustment_lock);
-    	
+
+        omp_set_lock(&adjustment_lock);
+
         typedef std::pair<int, Node*> Segment; // <begin, Node*>
         std::stack<Segment> s;
+        std::stack<Node*> nodes_to_del;
 
         s.push(Segment(0, _root));
         while (!s.empty()) {
             int begin = s.top().first;
             Node* node = s.top().second;
             const int SHOULD_END_POS = begin + node->size;
-            
-            omp_set_lock(&node->wMutex);
-            
+
             s.pop();
 
             for (int i = 0; i < node->num_items; i ++) {
@@ -1011,35 +980,18 @@ private:
                     }
                 }
             }
-            
-            omp_unset_lock(&node->wMutex);
-            
-            RT_ASSERT(SHOULD_END_POS == begin);
+
+//            RT_ASSERT(SHOULD_END_POS == begin);
 
             if (destory) {
-//                if (node->is_two) {
-//                    RT_ASSERT(node->build_size == 2);
-//                    RT_ASSERT(node->num_items == 8);
-//                    node->size = 2;
-//                    node->num_inserts = node->num_insert_to_data = 0;
-//                    node->none_bitmap[0] = 0xff;
-//                    node->child_bitmap[0] = 0;
-//                    omp_set_lock(&pending_two_lock);
-//                    pending_two.push(node);
-//                    omp_unset_lock(&pending_two_lock);
-//                } else {
-                    node->logical_delete = true;
-                    delete_items(node->items, node->num_items);
-                    const int bitmap_size = BITMAP_SIZE(node->num_items);
-                    delete_bitmap(node->none_bitmap, bitmap_size);
-                    delete_bitmap(node->child_bitmap, bitmap_size);
-                    delete_nodes(node, 1);
-//                }
+                nodes_to_del.push(node);
             }
         }
-        
+
         omp_unset_lock(&adjustment_lock);
-        
+
+        return nodes_to_del;
+
     }
 
     Node* insert_tree(Node* _node, const T& key, const P& value)
@@ -1048,42 +1000,58 @@ private:
         Node* path[MAX_DEPTH];
         int path_size = 0;
         int insert_to_data = 0;
-        
-        omp_set_lock(&_node->wMutex);
 
         for (Node* node = _node; ; ) {
-            RT_ASSERT(path_size < MAX_DEPTH);
-            path[path_size ++] = node;	
-            node->size ++;
-            node->num_inserts ++;
+//            RT_ASSERT(path_size < MAX_DEPTH);
+            path[path_size ++] = node;
             int pos = PREDICT_POS(node, key);
             if (BITMAP_GET(node->none_bitmap, pos) == 1) {
-                BITMAP_CLEAR(node->none_bitmap, pos);
+
+                omp_set_lock(&node->mutex);
+                if(BITMAP_GET(node->none_bitmap, pos) != 1){
+                    path_size--;
+                    omp_unset_lock(&node->mutex);
+                    continue;
+                }
+
+
                 node->items[pos].comp.data.key = key;
                 node->items[pos].comp.data.value = value;
-                
-                omp_unset_lock(&node->wMutex);
-                
+                BITMAP_CLEAR(node->none_bitmap, pos);
+
+                omp_unset_lock(&node->mutex);
+
                 break;
             } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
-                BITMAP_SET(node->child_bitmap, pos);
+
+                omp_set_lock(&node->mutex);
+                if(BITMAP_GET(node->child_bitmap, pos) != 0){
+                    path_size--;
+                    omp_unset_lock(&node->mutex);
+                    continue;
+                }
+
+
+
                 node->items[pos].comp.child = build_tree_two(key, value, node->items[pos].comp.data.key, node->items[pos].comp.data.value);
+                BITMAP_SET(node->child_bitmap, pos);
                 insert_to_data = 1;
-                
-                omp_unset_lock(&node->wMutex);
-                
+
+                omp_unset_lock(&node->mutex);
+
                 break;
             } else {
-            	
-            	omp_set_lock(&node->items[pos].comp.child->wMutex);
-            	omp_unset_lock(&node->wMutex);
-            	
+
                 node = node->items[pos].comp.child;
             }
         }
-        
+
         for (int i = 0; i < path_size; i ++) {
+            omp_set_lock(&(path[i]->mutex));
+            path[i]->size ++;
+            path[i]->num_inserts ++;
             path[i]->num_insert_to_data += insert_to_data;
+            omp_unset_lock(&(path[i]->mutex));
         }
 
         for (int i = 0; i < path_size; i ++) {
@@ -1097,25 +1065,25 @@ private:
                 T* keys = new T[ESIZE];
                 P* values = new P[ESIZE];
 
-                #if COLLECT_TIME
+#if COLLECT_TIME
                 auto start_time_scan = std::chrono::high_resolution_clock::now();
-                #endif
-                scan_and_destory_tree(node, keys, values);
-                #if COLLECT_TIME
+#endif
+                std::stack<Node*> nodes_to_del = scan_and_destory_tree(node, keys, values);
+#if COLLECT_TIME
                 auto end_time_scan = std::chrono::high_resolution_clock::now();
                 auto duration_scan = end_time_scan - start_time_scan;
                 stats.time_scan_and_destory_tree += std::chrono::duration_cast<std::chrono::nanoseconds>(duration_scan).count() * 1e-9;
-                #endif
+#endif
 
-                #if COLLECT_TIME
+#if COLLECT_TIME
                 auto start_time_build = std::chrono::high_resolution_clock::now();
-                #endif
+#endif
                 Node* new_node = build_tree_bulk(keys, values, ESIZE);
-                #if COLLECT_TIME
+#if COLLECT_TIME
                 auto end_time_build = std::chrono::high_resolution_clock::now();
                 auto duration_build = end_time_build - start_time_build;
                 stats.time_build_tree_bulk += std::chrono::duration_cast<std::chrono::nanoseconds>(duration_build).count() * 1e-9;
-                #endif
+#endif
 
                 delete[] keys;
                 delete[] values;
@@ -1125,6 +1093,15 @@ private:
                     int pos = PREDICT_POS(path[i-1], key);
                     path[i-1]->items[pos].comp.child = new_node;
                 }
+                while (!nodes_to_del.empty()) {
+                    Node* cur_node = nodes_to_del.top();
+                    nodes_to_del.pop();
+                    ori_delete_items(cur_node->items, cur_node->num_items);
+                    const int bitmap_size = BITMAP_SIZE(cur_node->num_items);
+                    ori_delete_bitmap(cur_node->none_bitmap, bitmap_size);
+                    ori_delete_bitmap(cur_node->child_bitmap, bitmap_size);
+                    ori_delete_nodes(cur_node, 1);
+                }
 
                 break;
             }
@@ -1133,7 +1110,5 @@ private:
         return path[0];
     }
 };
-
-//omp_unset_destory(&omp_lock);
 
 #endif // __LIPP_H__
